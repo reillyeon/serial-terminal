@@ -37,32 +37,39 @@ let paritySelector: HTMLSelectElement;
 let stopBitsSelector: HTMLSelectElement;
 let flowControlCheckbox: HTMLInputElement;
 let echoCheckbox: HTMLInputElement;
-let port: SerialPort | undefined;
-let reader: ReadableStreamDefaultReader | undefined;
+let connected = false;
+let portUnreadable: Promise<void> | undefined;
+let portUnwritable: Promise<void> | undefined;
+let streamController = new AbortController();
 
 const term = new Terminal();
-const encoder = new TextEncoder();
-term.on('data', data => {
-  const bytes = encoder.encode(data);
-  if (echoCheckbox.checked) {
-    term.writeUtf8(bytes);
-  }
-  if (port && port.writable) {
-    const writer = port.writable.getWriter();
-    writer.write(bytes);
-    writer.releaseLock();
+const termInputFromPort = new WritableStream({
+  write(chunk) {
+    term.writeUtf8(chunk);
   }
 });
+const termInputFromEcho = new WritableStream({
+  write(chunk) {
+    if (echoCheckbox.checked) {
+      term.writeUtf8(chunk);
+    }
+  }
+});
+const [termOutputForPort, termOutputForEcho] = new ReadableStream({
+  start(controller) {
+    term.on('data', data => {
+      controller.enqueue(data);
+    });
+  }
+}).pipeThrough(new TextEncoderStream()).tee();
 
 document.addEventListener('DOMContentLoaded', () => {
-  term.open(document.getElementById('terminal')!);
+  term.open(<HTMLElement>document.getElementById('terminal'));
 
   connectButton = <HTMLButtonElement>document.getElementById('connect');
-  connectButton.addEventListener('click', async () => {
-    if (port) {
-      if (reader)
-        reader.cancel();
-      await port.close();
+  connectButton.addEventListener('click', () => {
+    if (connected) {
+      streamController.abort();
     } else {
       requestNewPort();
     }
@@ -87,15 +94,17 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 async function requestNewPort() {
-  port = await navigator.serial.requestPort({});
-  connectToPort();
+  try {
+    const port = await navigator.serial.requestPort({});
+    await connectToPort(port);
+  } catch (e) {
+    if (e.name != 'NotFoundError') {
+      term.writeln(`<CONNECT ERROR: ${e.message}`);
+    }
+  }
 }
 
-async function connectToPort() {
-  if (!port) {
-    return;
-  }
-
+async function connectToPort(port: SerialPort) {
   const options = {
     baudrate: getSelectedBaudRate(),
     databits: Number.parseInt(dataBitsSelector.value),
@@ -103,9 +112,9 @@ async function connectToPort() {
     stopbits: Number.parseInt(stopBitsSelector.value),
     rtscts: flowControlCheckbox.checked
   };
-  console.log(options);
   await port.open(options);
 
+  connected = true;
   connectButton.textContent = 'Disconnect';
   baudRateSelector.disabled = true;
   customBaudRateInput.disabled = true;
@@ -115,31 +124,7 @@ async function connectToPort() {
   flowControlCheckbox.disabled = true;
   term.writeln('<CONNECTED>');
 
-  while (port.readable) {
-    try {
-      reader = port.readable.getReader();
-      while (true) {
-        const { value, done } = await reader.read();
-        term.writeUtf8(value);
-        if (done) {
-          break;
-        }
-      }
-      reader = undefined;
-    } catch (e) {
-      term.writeln(`<ERROR: ${e.message}>`);
-    }
-  }
-
-  term.writeln('<DISCONNECTED>');
-  connectButton.textContent = 'Connect';
-  baudRateSelector.disabled = false;
-  customBaudRateInput.disabled = false;
-  dataBitsSelector.disabled = false;
-  paritySelector.disabled = false;
-  stopBitsSelector.disabled = false;
-  flowControlCheckbox.disabled = false;
-  port = undefined;
+  processStreams(port);
 }
 
 function getSelectedBaudRate() {
@@ -147,4 +132,73 @@ function getSelectedBaudRate() {
     return Number.parseInt(customBaudRateInput.value);
   }
   return Number.parseInt(baudRateSelector.value);
+}
+
+async function processStreams(port: SerialPort) {
+  streamController = new AbortController();
+  portUnreadable = processReadableStream(port);
+  portUnwritable = processWritableStream(port);
+
+  // Read from the port until encountering an unrecoverable error or the user
+  // clicks the disconnect button.
+  await portUnreadable;
+
+  // Clean up any remaining streams and close the port.
+  streamController.abort();
+  await portUnwritable;
+  await port.close();
+
+  connected = false;
+  connectButton.textContent = 'Connect';
+  baudRateSelector.disabled = false;
+  customBaudRateInput.disabled = false;
+  dataBitsSelector.disabled = false;
+  paritySelector.disabled = false;
+  stopBitsSelector.disabled = false;
+  flowControlCheckbox.disabled = false;
+  term.writeln('<DISCONNECTED>');
+}
+
+async function processWritableStream(port: SerialPort) {
+  while (port && port.writable && !streamController.signal.aborted) {
+    const localEchoController = new AbortController();
+    const localEchoClosed = termOutputForEcho.pipeTo(
+      termInputFromEcho,
+      { signal: localEchoController.signal,
+        preventClose: true,
+        preventAbort: true,
+        preventCancel: true });
+    try {
+      await termOutputForPort.pipeTo(
+        port.writable,
+        { signal: streamController.signal,
+          preventClose: true,
+          preventAbort: true,
+          preventCancel: true});
+    } catch (e) {
+      if (e.name !== 'AbortError') {
+        term.writeln(`<WRITE ERROR: ${e.message}>`);
+      }
+    } finally {
+      localEchoController.abort();
+      await localEchoClosed.catch(() => {});
+    }
+  }
+}
+
+async function processReadableStream(port: SerialPort) {
+  while (port && port.readable && !streamController.signal.aborted) {
+    try {
+      await port.readable.pipeTo(
+        termInputFromPort,
+        { signal: streamController.signal,
+          preventClose: true,
+          preventAbort: true,
+          preventCancel: true });
+    } catch (e) {
+      if (e.name !== 'AbortError') {
+        term.writeln(`<READ ERROR: ${e.message}>`);
+      }
+    }
+  }
 }
